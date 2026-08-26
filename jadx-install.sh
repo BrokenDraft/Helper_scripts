@@ -1,6 +1,6 @@
 #!/bin/bash
 
-sudo apt update && sudo apt install default-java -y
+sudo apt update && sudo apt install adb default-jdk -y
 
 git clone https://github.com/skylot/jadx.git
 cd jadx
