@@ -1,70 +1,70 @@
 #!/bin/bash
+# cuttlefish-setup.sh — idempotent HOST setup for Cuttlefish
+#
+# This script installs ONLY host-side plumbing: virtualization packages
+# and cuttlefish-base/cuttlefish-user (drivers, udev rules, virtual
+# networking). Nothing Android is downloaded here. The system image, the
+# launcher and the fuzzers all come from the local AOSP build in ~/aosp.
+# 
+#
+# Safe to re-run at any time: every step checks before it acts.
+#
+# Daily example workflow (after the one-time full `m` in ~/aosp):
+#
+#   terminal 2 (device, occupies the terminal with logs):
+#     cd ~/cuttlefish
+#     HOME=$PWD bin/launch_cvd \
+#       --system_image_dir=/media/user/Sabrent500/aosp/out/target/product/vsoc_x86_64_only \
+#       --num_instances=1
+#
+#   terminal 1 (build):
+#     cd ~/aosp
+#     source build/envsetup.sh
+#     lunch aosp_cf_x86_64_only_phone-trunk_staging-userdebug
+#     m example_fuzzer            # rebuild whatever fuzzer you're working on
+#     adb root && adb sync data
+#     adb shell /data/fuzz/x86_64/example_fuzzer/example_fuzzer
+
 set -euo pipefail
 
-WORKDIR="$HOME/cuttlefish"
-mkdir -p "$WORKDIR"
-cd "$WORKDIR"
-
-CF_REPO_LINE="deb https://us-apt.pkg.dev/projects/android-cuttlefish-artifacts android-cuttlefish main"
-CF_LIST=/etc/apt/sources.list.d/artifact-registry.list
-
-BUILD_ID="16644040"
-TARGET="aosp_cf_x86_64_only_phone-userdebug"
-BASE_URL="https://ci.android.com/builds/submitted/$BUILD_ID/$TARGET/latest"
-
-IMG_ZIP="aosp_cf_x86_64_only_phone-img-$BUILD_ID.zip"
-HOST_PKG="cvd-host_package.tar.gz"
+# ---------------------------------------------------------------------------
+# 1. Base packages (apt is idempotent by itself)
+# ---------------------------------------------------------------------------
+sudo apt update
+sudo apt install -y git libvirt-clients libvirt-daemon-system \
+    qemu-kvm bridge-utils
 
 # ---------------------------------------------------------------------------
-# Download helper: ci.android.com serves an HTML viewer page, not the file.
-# Extract the signed GCS URL from JSVariables['artifactUrl'] and fetch that.
+# 2. Cuttlefish host packages.
+#    These are host plumbing only and are independent of the Android build,
+#    so they never need to match the image version. Skipped when installed.
+#    To force a rebuild/reinstall: sudo apt remove cuttlefish-base cuttlefish-user
 # ---------------------------------------------------------------------------
-download_ci_artifact() {
-    local page_url="$1" out="$2" real_url
-
-    real_url=$(curl -fsSL "$page_url" | python3 -c '
-import sys, re, json
-html = sys.stdin.read()
-m = re.search(r"\"artifactUrl\":(\".*?\")", html)
-if not m:
-    sys.exit(1)
-print(json.loads(m.group(1)))
-') || { echo "Could not extract artifactUrl from $page_url" >&2; return 1; }
-
-    echo "Downloading $out ..."
-    curl -fL -C - -o "$out" "$real_url"
-}
-
-# ---------------------------------------------------------------------------
-# Dependencies
-# ---------------------------------------------------------------------------
-sudo apt install -y python3 python3-pip git unzip \
-    libvirt-clients libvirt-daemon-system qemu-kvm bridge-utils
+if dpkg -s cuttlefish-base >/dev/null 2>&1 && dpkg -s cuttlefish-user >/dev/null 2>&1; then
+    echo "cuttlefish host packages already installed, skipping."
+else
+    sudo apt install -y devscripts equivs config-package-dev debhelper-compat golang
+    CF_SRC="$HOME/Repo/android-cuttlefish"
+    if [ ! -d "$CF_SRC" ]; then
+        git clone https://github.com/google/android-cuttlefish "$CF_SRC"
+    fi
+    ( cd "$CF_SRC" && tools/buildutils/build_packages.sh )
+    sudo dpkg -i "$CF_SRC"/cuttlefish-base_*_*64.deb \
+                 "$CF_SRC"/cuttlefish-user_*_*64.deb \
+        || sudo apt-get install -f
+fi
 
 # ---------------------------------------------------------------------------
-# Artifacts
+# 3. Group membership. usermod is a no-op if already a member; reboot only
+#    when the current session does not have the groups yet.
 # ---------------------------------------------------------------------------
-rm -f "$IMG_ZIP" "$HOST_PKG"   # clear any corrupt leftovers from earlier runs
+for grp in kvm cvdnetwork render; do
+    sudo usermod -aG "$grp" "$USER"
+done
 
-download_ci_artifact "$BASE_URL/$IMG_ZIP" "$IMG_ZIP"
-download_ci_artifact "$BASE_URL/$HOST_PKG" "$HOST_PKG"
+if ! id -nG | tr ' ' '\n' | grep -qx kvm; then
+    echo "Groups changed; rebooting so they take effect."
+    sudo reboot
+fi
 
-# Fail fast on truncated/corrupt downloads before extracting
-unzip -t "$IMG_ZIP" > /dev/null
-tar -tzf "$HOST_PKG" > /dev/null
-
-unzip "$IMG_ZIP"
-tar -xzf "$HOST_PKG"
-
-# Cuttlefish apt repo (idempotent, no duplicate entries on rerun)
-mkdir -p ~/.local/tmp && cd ~/.local/tmp
-sudo apt install -y devscripts equivs config-package-dev debhelper-compat golang curl
-git clone https://github.com/google/android-cuttlefish
-cd android-cuttlefish
-tools/buildutils/build_packages.sh
-sudo dpkg -i ./cuttlefish-base_*_*64.deb || sudo apt-get install -f
-sudo dpkg -i ./cuttlefish-user_*_*64.deb || sudo apt-get install -f
-sudo usermod -aG kvm,cvdnetwork,render $USER
-sudo reboot
-
-echo "Done. To launch: HOME=$(pwd) bin/launch_cvd --num_instances=1"
+echo "Host setup complete. See the header comment for the daily workflow."
